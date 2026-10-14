@@ -22,74 +22,104 @@ furnished to do so, subject to the following conditions:
 #include <type_traits>
 #include <utility>
 #include <thread>
+
+
 /* struct definitions */
-struct alignas(std::hardware_destructive_interference_size*  2) SPSC_queue{
-	__attribute__((aligned(128))) std::atomic<std::uint32_t> head_acutal ; 	
-
-
-	__attribute__((aligned(128))) std::atomic<std::uint32_t> tail_acutal ; 
-
-	/* For consumers to take work from others */ 
-	int work_steal();
+struct __attribute__((aligned(64))) local_prod_data_t{
+	void* remote_addr ;
+	void* addr ; /* This contains 16 bits of local_write_left and conatins the addr to the pointer to the interal queue*/ 
+	std::uint64_t local_curr_write;
+	std::uint16_t local_id_and_work_mode ;/* contains localid and the work mode */
+}; 
+struct __attribute__(( aligned(64))) local_cons_data_t{
+	void* ma_remote_addr_ ; /* contians the mask of the work steal mode and the remote address*/
+	void* addr ; /* This contains 16 bits of local_read_left and conatins the addr to the pointer to the interal queue*/ 
+	std::uint64_t local_curr_read;
+	std::uint16_t local_id_and_work_mode ;/* contains localid and the work mode */
 };
 
 
-/* These are the local variables of each queue in a thread */ 
-/* note each queue can represent up to 16Gb of data at a 4byte per element number goes up as the data size is larger  */
-struct __attribute__((packed , aligned(4)))mask_T1{
-	unsigned char mask : 8 ;
-	std::uint32_t pad : 24;
+static_assert(sizeof(local_cons_data_t) == 64, "Sizeof local_cons_data_t is not 64" );
+static_assert(sizeof(local_prod_data_t) == 64, "Sizeof local_prod_data_t is not 64" );
+
+
+struct  spsc_queue{
+
+	/* PRODUCER*/ 
+	alignas(std::hardware_destructive_interference_size * 2 )std::atomic<std::uint64_t> head_producer ; 
+
+	/* values local to the producer */ 
+	local_prod_data_t prod_data_loc_; /* This is the local producer data */
+
+	/* CONSUMER */
+	alignas(std::hardware_destructive_interference_size* 2 )std::atomic<std::uint64_t> tail_consumer ; 
+	local_cons_data_t cons_data_loc ;
+
+	
+	
+	/* For consumers to take work from others */
+	int work_steal() noexcept;
+
+	/* checkign functions */
+	bool empty() noexcept ; 
+	bool full(); 
 };
 
-enum class zc_mask_state_prod: unsigned char {
-	NO_STATE = 0x00, 
-	BUF_GIVING = 0x01 , 
-	BUF_WRITING
-};
-enum class zc_mask_state_cons: unsigned char {
-	NO_STATE = 0x00, 
-	BUF_READING = 0x01 , 
-	BUF_FINSHED = 0x02,
-};
-static_assert(sizeof(mask_T1) == 4 , "mask size is not 4 ");
-struct alignas(64)  zc_ring_local_t {
-	void* addr ;
-	std::uint16_t thread_id ;
-	std::uint16_t m_position ;
-	std::uint32_t local_count ;
-	std::uint32_t prod_sz;
-	mask_T1 mask1 ;
-};
 
 enum class ZC_QUEUE_TYPE : unsigned char  {
 	PRODUCER  = 0x00 , 
 	CONSUMER = 0x01
 };
 
-/* Producer and conbsunmers must be counted on proper multiples of 2 */
-template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE = 64 > 
+
+/* zc_ring 
+ * P -> PRODUCER 
+ *C -> CONSUMER 
+ * BS -> BATCH_SIZE
+*/
+template <typename T , size_t P, size_t C , size_t BS = 64 > 
 struct zc_ring{
-	SPSC_queue m_queues[PRODUCER];
-	alignas(std::hardware_destructive_interference_size) void* addr[PRODUCER];
-	size_t capacity{0};
-	size_t prod_sz{0};
-	zc_ring(size_t size);
+	public : 
 
-	template <ZC_QUEUE_TYPE  B>
-	int register_queue(zc_ring_local_t* local_var)noexcept;
+		zc_ring() = default ;
+		~zc_ring();
+	/* Methods */ 
+		/* personalized setup for each queue */
+		int init_queue();
+		/* this returns a buffer that values can be written to 
+		 * This enusres no copies are made on data transfer 
+		 * This saves space and reduces instructions count spent on copying */ 
+		T* get_prod_write_buffer(size_t sz );
+		/* This pushes the bulk to the queue */
+		int push_bulk(size_t sz);
 
-	T*  zc_get_push_buffer( zc_ring_local_t* local_dat , size_t  count  ) noexcept;
-	int zc_push(zc_ring_local_t* local_d  ) noexcept; 
-	int zc_push_bulk(zc_ring_local_t* local_d  ) noexcept ;
+		__attribute__((always_inline)) inline int push(){
+			return push_bulk(1);
+		}
+		/* This gives the buffer that conatins the values 
+		 * Owners of consumers can decide to wait as long as possible to do stuff with the buffer 
+		 * NOTE delayed time with the buffer will lead to blocking and that queue will not be able to move on*/
+		int pop_get_buffer(const T** buf);
+		
+		/* This frees up the space in the buffer for write to begin*/
+		int pop_bulk(size_t sz );
 
-	const T* zc_pop_bulk(zc_ring_local_t* local_data , size_t  count ) noexcept;
-	const T*  zc_pop(zc_ring_local_t* local_data ) noexcept ;
-	int zc_pop_read(zc_ring_local_t* local_data)noexcept; 
-	~zc_ring();
+		__attribute__((always_inline)) inline  int pop(){
+			return pop_bulk(1);
+		}
+
+		/* Static methods */ 
+		constexpr static inline size_t get_batch_size() {
+			return  BS;
+		}
+		constexpr static inline size_t get_producer_count(){
+			return P;
+		}
+		constexpr static inline size_t get_consumer_count(){
+			return C;
+		}
 	private : 
-		/* this will have to add to the global atomic vairables */
-		int add_buffer(zc_ring_local_t*);
-		int add_pop_data(zc_ring_local_t*);
+
 };
 
 // FUNCTIONS AND HELPERS
@@ -101,12 +131,12 @@ std::uint16_t generate_thread_id_prod(){
 	return value ;
 }
 
-template <size_t  P>
+template <size_t P  >
 std::uint16_t generate_thread_id_cons(){
 	static std::atomic<std::uint16_t> _th_id2{0};
 	auto value = _th_id2.load(std::memory_order_acquire);
 	_th_id2.fetch_add(1 ,std::memory_order_release );
-	return value  & P;
+	return value  & (P-1);
 }
 
 __attribute__((noinline , cold))void tear_down(){
