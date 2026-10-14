@@ -1,3 +1,4 @@
+
 /* 
  * Author : Paschal Ahanmisi 
  * Date : October 2026 
@@ -26,16 +27,16 @@ furnished to do so, subject to the following conditions:
 
 /* struct definitions */
 struct __attribute__((aligned(64))) local_prod_data_t{
-	void* remote_addr ;
-	void* addr ; /* This contains 16 bits of local_write_left and conatins the addr to the pointer to the interal queue*/ 
-	std::uint64_t local_curr_write;
-	std::uint16_t local_id_and_work_mode ;/* contains localid and the work mode */
+	void* m_remote_addr_ ;
+	void* m_addr_ ; /* This contains 16 bits of local_write_left and conatins the addr to the pointer to the interal queue*/ 
+	std::uint64_t m_local_curr_write_;
+	std::uint16_t m_local_id_and_work_mode_ ;/* contains localid and the work mode */
 }; 
 struct __attribute__(( aligned(64))) local_cons_data_t{
 	void* ma_remote_addr_ ; /* contians the mask of the work steal mode and the remote address*/
-	void* addr ; /* This contains 16 bits of local_read_left and conatins the addr to the pointer to the interal queue*/ 
-	std::uint64_t local_curr_read;
-	std::uint16_t local_id_and_work_mode ;/* contains localid and the work mode */
+	void* m_addr_ ; /* This contains 16 bits of local_read_left and conatins the addr to the pointer to the interal queue*/ 
+	std::uint64_t m_local_curr_read_;
+	std::uint16_t m_local_id_and_work_mode_ ;/* contains localid and the work mode */
 };
 
 
@@ -49,11 +50,11 @@ struct  spsc_queue{
 	alignas(std::hardware_destructive_interference_size * 2 )std::atomic<std::uint64_t> head_producer ; 
 
 	/* values local to the producer */ 
-	local_prod_data_t prod_data_loc_; /* This is the local producer data */
+	local_prod_data_t m_prod_data_loc_; /* This is the local producer data */
 
 	/* CONSUMER */
 	alignas(std::hardware_destructive_interference_size* 2 )std::atomic<std::uint64_t> tail_consumer ; 
-	local_cons_data_t cons_data_loc ;
+	local_cons_data_t m_cons_data_loc ;
 
 	
 	
@@ -65,23 +66,18 @@ struct  spsc_queue{
 	bool full(); 
 };
 
-
-enum class ZC_QUEUE_TYPE : unsigned char  {
-	PRODUCER  = 0x00 , 
-	CONSUMER = 0x01
-};
-
-
-/* zc_ring 
- * P -> PRODUCER 
- *C -> CONSUMER 
- * BS -> BATCH_SIZE
+/* is a multiple of 8*/
+template <size_t S >
+concept is_multiple_of_8 = S % 8 == 0 ;
+/* zc_ring
 */
-template <typename T , size_t P, size_t C , size_t BS = 64 > 
+template <typename T , size_t P /*PRODUCER*/, size_t C /* CONSUMER*/ , size_t SZ /*SIZE OF BUFFER */ ,
+	 size_t BS = 64 /*BATCH_SIZE*/>
+requires is_multiple_of_8<SZ>
 struct zc_ring{
 	public : 
 
-		zc_ring() = default ;
+		zc_ring()  ;
 		~zc_ring();
 	/* Methods */ 
 		/* personalized setup for each queue */
@@ -118,7 +114,12 @@ struct zc_ring{
 		constexpr static inline size_t get_consumer_count(){
 			return C;
 		}
-	private : 
+		constexpr static inline size_t get_size(){return SZ;}
+	private :
+		/*spsc queue is aligned on a hardware destructive size boundary * 2 to aviod false sharing agressive prefetching and cache line contention */
+		spsc_queue m_queue_[P];
+		alignas(64) void* m_addrs_[P];
+		size_t m_single_buf_sz_;
 
 };
 
@@ -135,8 +136,12 @@ template <size_t P  >
 std::uint16_t generate_thread_id_cons(){
 	static std::atomic<std::uint16_t> _th_id2{0};
 	auto value = _th_id2.load(std::memory_order_acquire);
+	if(static_cast<size_t>(value) >= P ){
+		_th_id2.store(0 ,std::memory_order_release);
+		return 0;
+	}
 	_th_id2.fetch_add(1 ,std::memory_order_release );
-	return value  & (P-1);
+	return value ; 
 }
 
 __attribute__((noinline , cold))void tear_down(){
@@ -145,57 +150,18 @@ __attribute__((noinline , cold))void tear_down(){
 }
 
 
-// 2. Your template now works perfectly
-template <typename T, size_t PRODUCER, size_t CONSUMER, size_t BATCH_SIZE>                                               
-zc_ring<T, PRODUCER, CONSUMER , BATCH_SIZE>::zc_ring(size_t size) : capacity(size){
-		
-	size_t sz ;
-	if(prod_sz == 0 ){
-	 sz = (capacity / PRODUCER) ;
-	 sz = (4096 + sz )  & (~(4096ULL-1ULL)) ; /* give a properly aligned size */ 
-		prod_sz = sz ;
-	}else {
-		sz = prod_sz;
-	}
-	// include fuctionlaity hear for huge paegs
-	//
-	// // implement the queusel
-	 int ret ; 
-	for(size_t i {0} ; i <PRODUCER ; i++){
-		auto addr1 = mmap(nullptr , sz , PROT_READ| PROT_WRITE ,MAP_SHARED | MAP_ANONYMOUS | MAP_LOCKED ,-1 , 0 );
-		if(addr == MAP_FAILED ) {	
-			tear_down();
-		}
-		 ret = mlock(  addr1, sz );
-		if(ret == -1 ) {tear_down();}
-		addr[i] = addr1;  
-	}
-			
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>  
+requires is_multiple_of_8<SZ>
+zc_ring<T, P, C , SZ , BS>::zc_ring(){
 }
 
-/* Function only callable once in a fucntion else undefined behaviour*/
-template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE > 
-template<ZC_QUEUE_TYPE  B>
-int zc_ring<T, PRODUCER,  CONSUMER, BATCH_SIZE>::register_queue(zc_ring_local_t* local_var)noexcept{
-	if constexpr (B == ZC_QUEUE_TYPE::PRODUCER){
-		auto id = generate_thread_id_prod();
-		new (local_var) zc_ring_local_t{addr[id] , id , 0 , 0 ,prod_sz , {0,0}};
-		m_queues[id].head_actual.store(0 , std::memory_order_release);
-	}else if constexpr (B  == ZC_QUEUE_TYPE::CONSUMER){
-		auto id = generate_thread_id_cons<CONSUMER- 1 >();	
-		new (local_var) zc_ring_local_t{addr[id] , id , 0 , 0 , prod_sz , {0, 0} };
-		m_queues[id].tail_actual.store(0 , std::memory_order_release);
-		
-	}else {
-		static_assert(false, "This is not an enum type" );
-	}
-
-	return 0;
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
+int zc_ring<T, PRODUCER,  CONSUMER, BATCH_SIZE>::register_queue(){
 }
 
 
 
-template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE > 
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
 zc_ring<T, PRODUCER , CONSUMER , BATCH_SIZE>::~zc_ring(){
 	
 	for(size_t i {0} ; i < PRODUCER ; i++){
@@ -204,8 +170,9 @@ zc_ring<T, PRODUCER , CONSUMER , BATCH_SIZE>::~zc_ring(){
 }
 
 
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
 template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE >
-T* zc_ring<T,PRODUCER,CONSUMER , BATCH_SIZE>::zc_get_push_buffer( zc_ring_local_t* local_dat , size_t count ) noexcept{
+T* zc_ring<T,PRODUCER,CONSUMER , BATCH_SIZE>::zc_get_push_buffer( zc_ring_local_t* local_dat , size_t count ) {
 	/* check if the buffer is ready for push */
 	auto amount = count * sizeof(T);
 	if((amount  & (BATCH_SIZE -1 ))){
@@ -233,12 +200,14 @@ T* zc_ring<T,PRODUCER,CONSUMER , BATCH_SIZE>::zc_get_push_buffer( zc_ring_local_
 }
 	
 
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
 template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE >
-int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_push(zc_ring_local_t* local_d )noexcept{
+int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_push(zc_ring_local_t* local_d ){
 	return 	zc_push_bulk(local_d);
 }
 template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE >
-int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_push_bulk(zc_ring_local_t* local_d  )noexcept {
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
+int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_push_bulk(zc_ring_local_t* local_d  ) {
 
 		// add mask to block if buffer not pushed but donated and is holding it 
 		
@@ -249,7 +218,8 @@ int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_push_bulk(zc_ring_local_t* 
 // asynchronous is hard 
 // // this currently will only work for batch data will get gibberush on normal count 
 template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE >
-const T* zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop_bulk(zc_ring_local_t* local_data  , size_t count  ) noexcept{
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
+const T* zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop_bulk(zc_ring_local_t* local_data  , size_t count  ) {
 	/* Be careful to check when buffer is empty or roll over is needed qand other stuff */	
 	auto amount = count * sizeof(T);
 	if((amount  & (BATCH_SIZE -1 ))){
@@ -270,49 +240,19 @@ const T* zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop_bulk(zc_ring_local
 
 
 template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE >
-const T*  zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop(zc_ring_local_t* local_data ) noexcept{
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
+const T*  zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop(zc_ring_local_t* local_data ) {
 
 	return zc_pop_bulk(local_data , 1 );
 } 
 	
 template <typename T , size_t PRODUCER , size_t CONSUMER , size_t BATCH_SIZE >
-int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop_read(zc_ring_local_t* local_data)noexcept{
+template <typename T, size_t P, size_t C, size_t SZ , size_t BS>                                               
+int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop_read(zc_ring_local_t* local_data){
 	local_data->mask1.mask = std::to_underlying(zc_mask_state_cons::BUF_FINSHED);	
 	return 0;
 }
-// MAIN 
+// MAIN
 int main(){
-	zc_ring<int , 2ULL , 2ULL , 64> my_queue{4096ULL};
-	
-	std::jthread th1{
-		[&my_queue](){
-			zc_ring_local_t local_data ;
-			my_queue.register_queue<ZC_QUEUE_TYPE::PRODUCER>(&local_data);
-			auto ptr = my_queue.zc_get_push_buffer(&local_data,16 );
-			for(auto i{0uz} ; i < 16 ; i++){
-				ptr[i] = static_cast<int>(i) * 100 ; 	
-			}
-			my_queue.zc_push_bulk(&local_data);
-		}
-	};
-	std::jthread th2{
-
-		[&my_queue](){
-			zc_ring_local_t local_data ;
-			my_queue.register_queue<ZC_QUEUE_TYPE::PRODUCER>(&local_data);
-		}
-	};
-	std::jthread th3{
-		[&my_queue](){
-			zc_ring_local_t local_data ;
-			my_queue.register_queue<ZC_QUEUE_TYPE::CONSUMER>(&local_data);
-		}
-	};
-	std::jthread th4{
-		[&my_queue](){
-			zc_ring_local_t local_data ;
-			my_queue.register_queue<ZC_QUEUE_TYPE::CONSUMER>(&local_data);
-		}
-	};
 	return 0 ;
 }
