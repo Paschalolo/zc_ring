@@ -22,6 +22,7 @@ furnished to do so, subject to the following conditions:
 #include <cstdio>
 #include <type_traits>
 #include <utility>
+#include <thread>
 /* struct definitions */
 struct  zc_ring_local_t; 
 struct alignas(std::hardware_destructive_interference_size*  2) SPSC_queue{
@@ -252,5 +253,37 @@ int zc_ring<T ,  PRODUCER,CONSUMER , BATCH_SIZE>::zc_pop_read(zc_ring_local_t* l
 }
 // MAIN 
 int main(){
+	zc_ring<int , 2ULL , 2ULL , 64> my_queue{4096ULL};
+	
+	std::jthread th1{
+		[&my_queue](){
+			zc_ring_local_t local_data ;
+			my_queue.register_queue<ZC_QUEUE_TYPE::PRODUCER>(&local_data);
+			auto ptr = my_queue.zc_get_push_buffer(&local_data,16 );
+			for(auto i{0uz} ; i < 16 ; i++){
+				ptr[i] = static_cast<int>(i) * 100 ; 	
+			}
+			my_queue.zc_push_bulk(&local_data);
+		}
+	};
+	std::jthread th2{
+
+		[&my_queue](){
+			zc_ring_local_t local_data ;
+			my_queue.register_queue<ZC_QUEUE_TYPE::PRODUCER>(&local_data);
+		}
+	};
+	std::jthread th3{
+		[&my_queue](){
+			zc_ring_local_t local_data ;
+			my_queue.register_queue<ZC_QUEUE_TYPE::CONSUMER>(&local_data);
+		}
+	};
+	std::jthread th4{
+		[&my_queue](){
+			zc_ring_local_t local_data ;
+			my_queue.register_queue<ZC_QUEUE_TYPE::CONSUMER>(&local_data);
+		}
+	};
 	return 0 ;
 }
