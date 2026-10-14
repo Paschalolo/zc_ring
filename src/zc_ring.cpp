@@ -32,6 +32,8 @@ constexpr size_t MASK_2MB {(2ULL * 1024ULL * 1024ULL) - 1ULL};
 constexpr size_t MASK_1GB {(1ULL * 1024ULL * 1024ULL * 1024ULL) - 1ULL};
 constexpr size_t MASK_48bits {0xFFFFFFFFFFFFULL};
 constexpr size_t MASK_FR16bits {0xFFFF000000000000ULL};
+constexpr std::uint16_t MASK_LOCAL_ID {0xFF};
+constexpr std::uint16_t MASK_WORKMODE {0xFF00};
 /* Enum Definitions */ 
 enum class ZC_TYPE {
 	PROD , CONSU,
@@ -189,6 +191,21 @@ std::uint16_t extract_localno_from_addr(void* addr ){
 void* insert_size_to_addr(void* addr , std::uint16_t sz ) {
 	 return reinterpret_cast<void*>((reinterpret_cast<std::uint64_t>(addr) & MASK_48bits ) | (static_cast<std::uint64_t>(sz) << 48ULL ) ) ;
 }
+
+std::uint16_t extract_local_id(std::uint16_t value ){
+	return value & MASK_LOCAL_ID ;
+}
+std::uint8_t extract_workmode(std::uint16_t value ){
+	 return static_cast<std::uint8_t>((value & MASK_WORKMODE) >> 8 ) ;
+}
+
+std::uint16_t insert_local_id(std::uint16_t value , std::uint16_t localid){
+	return (value & MASK_WORKMODE) | (localid & MASK_LOCAL_ID) ;
+}
+
+std::uint16_t insert_workmode(std::uint16_t value , std::uint8_t workmode){
+	return (value & MASK_LOCAL_ID)  | static_cast<std::uint16_t>((static_cast<std::uint32_t>(workmode) << 8U));
+} 
 //--------------------------------------------------------
 
 template <typename T, size_t P, size_t C, size_t SZ , size_t BS>  
@@ -254,10 +271,15 @@ template <ZC_TYPE A>
 int zc_ring<T, P , C ,SZ ,  BS>::init_queue(){
 	if constexpr (A == ZC_TYPE::PROD) {
 		auto id = generate_thread_id_prod();
-		m_queue_[id].head_producer= 0 ;
+		m_queue_[id].head_producer.store( 0 , std::memory_order_release);
 	 	auto ptr = m_addrs_[id];
-		new (&(m_queue_[id].m_prod_data_loc_)) local_prod_data_t{nullptr,insert_size_to_addr(ptr,0) ,0 ,  };
+		new (&(m_queue_[id].m_prod_data_loc_)) local_prod_data_t{nullptr,insert_size_to_addr(ptr,0) ,0 , insert_workmode(id,0) };
+	
 	}else if constexpr (A == ZC_TYPE::CONSU) {
+		auto id = generate_thread_id_prod();
+		m_queue_[id].tail_consumer.store(0, std::memory_order_release);
+	 	auto ptr = m_addrs_[id];
+		new (&(m_queue_[id].m_cons_data_loc_)) local_cons_data_t{0 ,insert_size_to_addr(ptr,0) ,0 , insert_workmode(id,0) };
 	}else {
 		static_assert(false, "This type doesnot exit " );
 	}
