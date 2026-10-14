@@ -123,6 +123,12 @@ struct zc_ring{
 
 };
 
+template <typename T , size_t SZ>
+struct alignas(64) Payload{
+	std::uint32_t m_sz_;
+	alignas(alignof(T)) T m_data[SZ];
+	
+};
 // FUNCTIONS AND HELPERS
 
 std::uint16_t generate_thread_id_prod(){
