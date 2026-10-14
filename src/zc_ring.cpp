@@ -2,7 +2,7 @@
  * Author : Paschal Ahanmisi 
  * Date : October 2026 
  
-Copyright (c) 2025 <pastechnology1@gmail.com>
+Copyright (c) 2026 <pastechnology1@gmail.com>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
