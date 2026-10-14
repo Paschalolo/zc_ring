@@ -13,7 +13,6 @@ furnished to do so, subject to the following conditions:
  */
 
 
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <new>
@@ -24,14 +23,14 @@ furnished to do so, subject to the following conditions:
 #include <utility>
 #include <thread>
 /* struct definitions */
-struct  zc_ring_local_t; 
 struct alignas(std::hardware_destructive_interference_size*  2) SPSC_queue{
 	__attribute__((aligned(128))) std::atomic<std::uint32_t> head_acutal ; 	
 
 
-	__attribute__((aligned(128))) std::atomic<std::uint32_t> tail_acutal ; 	
-	bool empty(zc_ring_local_t* local_data);
-	int work_steal(zc_ring_local_t* local_data);
+	__attribute__((aligned(128))) std::atomic<std::uint32_t> tail_acutal ; 
+
+	/* For consumers to take work from others */ 
+	int work_steal();
 };
 
 
