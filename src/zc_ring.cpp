@@ -77,12 +77,23 @@ struct  spsc_queue{
 	/* PRODUCER*/ 
 	alignas(std::hardware_destructive_interference_size * 2 )std::atomic<std::uint64_t> head_producer ; 
 
-	/* values local to the producer */ 
-	// local_prod_data_t m_prod_data_loc_; /* This is the local producer data */
 
 	/* CONSUMER */
-	alignas(std::hardware_destructive_interference_size* 2 )std::atomic<std::uint64_t> tail_consumer ; 
-	// local_cons_data_t m_cons_data_loc ;
+	/* NOTE : We seperate both data because we want to lower contention and latency at synchronization intervals and also reduce cohenrency presure on memoery*/
+
+
+
+	/* this represents the position as to in which a new read is available
+	 * This is what is displayed to work stealers to take from to read 
+	 * This will be hit by cnosumers who work steal at synchronization 
+	 * */
+	alignas(std::hardware_destructive_interference_size* 2 )std::atomic<std::uint64_t> tail_consumer ;
+
+	/* this represents the local state of the consumer where its actual buffer has been read and can be reclaimined for writing 
+	 * This is what is deisplayed locally to my lcoal count to know how much i have actually read and is freable to use for writing . Hence this will be hit by producers on synchronization time 
+	 * */
+	alignas(std::hardware_destructive_interference_size * 2 ) std::atomic<std::uint64_t> tail_consumer_actual;
+
 
 	
 	
@@ -313,6 +324,7 @@ int zc_ring<T, P , C ,SZ ,  BI , BS , CS>::init_queue(zc_tstruct* data){
 	}else if constexpr ((A == ZC_TYPE::CONSU) && std::is_same_v<zc_tstruct , local_cons_data_t>) {
 		auto id = generate_thread_id_prod();
 		m_queue_[id].tail_consumer.store(0, std::memory_order_release);
+		m_queue_[id].tail_consumer_actual.store(0, std::memory_order_release);
 	 	auto ptr = m_addrs_[id];
 		new (data) local_cons_data_t{0 ,insert_size_to_addr(ptr,0) , 0 ,0 , insert_workmode(id,0) , 0 };
 		return id ;
@@ -383,6 +395,8 @@ int   zc_ring<T, P , C ,SZ , BI , BS , CS>::push_bulk(void* addr , size_t sz ){
 	constexpr size_t payload_sz_alignment = ((sizeof(std::uint32_t) * 2 ) <= alignmentOfT) ? (sizeof(std::uint32_t)* 2 )  : alignmentOfT;
 	*reinterpret_cast<Payload<T>*>(reinterpret_cast<unsigned char*>(addr) - payload_sz_alignment )->m_actual_data_sz = sz;
 }
+
+
 template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
 requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
 int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_get_buffer( local_cons_data_t* local_data, const T** buf){
