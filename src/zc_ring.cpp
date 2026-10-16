@@ -125,7 +125,7 @@ template <typename T , size_t P /*PRODUCER*/, size_t C /* CONSUMER*/ , size_t SZ
 	  size_t BI = 8 /* batch increment i.e BATCH_SIZE * BI is how much a producer will produce or consume */ ,
 	  size_t BS = 64 /*BATCH_SIZE*/,
 	  size_t CS = 64 /* Cache line size*/ >
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> 
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 struct zc_ring{
 	public : 
 
