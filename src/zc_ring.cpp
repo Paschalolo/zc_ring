@@ -15,6 +15,8 @@ furnished to do so, subject to the following conditions:
 
 #include <concepts>
 #include <cstddef>
+#include <sched.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <linux/mman.h>
 #include <atomic>
@@ -97,8 +99,6 @@ struct  spsc_queue{
 
 	
 	
-	/* For consumers to take work from others */
-	int work_steal() noexcept;
 
 	/* checkign functions */
 	bool empty() noexcept ; 
@@ -182,6 +182,10 @@ struct zc_ring{
 		
 		alignas(std::hardware_destructive_interference_size* 2 ) void* m_addrs_[P];
 		std::uint64_t m_prod_size_; /* this stores it in the count of how many batch sizes it has */
+	
+
+		/* For consumers to take work from others */
+		int work_steal(local_cons_data_t* lcaol_data ) noexcept;
 
 };
 
@@ -255,8 +259,11 @@ static inline __attribute__((always_inline)) std::uint16_t insert_local_id(std::
 
 //--------------------------------------------------------
 
+
+
+
 template <typename T, size_t P, size_t C, size_t SZ , size_t BI  , size_t BS , size_t CS >  
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 zc_ring<T, P, C , SZ ,  BI , BS , CS >::zc_ring(){
 	/* Regualr allocation for arays in which producer are less than a page size */
 	if constexpr ((SZ/P) <= (1024ULL * 4)) {
@@ -303,7 +310,7 @@ zc_ring<T, P, C , SZ ,  BI , BS , CS >::zc_ring(){
 }
 
 template <typename T, size_t P, size_t C, size_t SZ , size_t BI ,  size_t BS , size_t CS >                                               
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 zc_ring<T, P , C ,SZ , BI ,  BS , CS >::~zc_ring(){
 	// for now in shutdown 	to shutdown 
 	for(auto i {0uz} ; i < P ; i++){
@@ -312,8 +319,61 @@ zc_ring<T, P , C ,SZ , BI ,  BS , CS >::~zc_ring(){
 }
 
 
+template <typename T, size_t P, size_t C, size_t SZ , size_t BI  , size_t BS , size_t CS >  
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
+int zc_ring<T, P, C , SZ ,  BI , BS , CS >::work_steal(local_cons_data_t* local_consumer) noexcept {
+	if(!local_consumer) return -1;
+	auto id = extract_local_id(local_consumer->m_local_id_and_work_mode_);
+	for(auto i{0uz} ; i < P ; i++){
+		if(static_cast<std::uint64_t>(id) != i){
+			auto h_prod = m_queue_[i].head_producer.load(std::memory_order_acquire);	
+			auto t_cons =m_queue_[i].tail_consumer.load(std::memory_order_acquire);
+			// check empty
+			if(h_prod == t_cons){
+				sched_yield() ; 
+				continue ;
+			}
+			auto real_cons_no = t_cons & (BI-1);
+			auto inc =  (real_cons_no + BI )  < m_prod_size_;
+			size_t count ;
+			if(inc)/* Hence we steal to the end */ {
+				bool t = __builtin_uaddl_overflow(t_cons ,(m_prod_size_ -real_cons_no) , &count );
+				if(h_prod < count   || (t && count > h_prod)){
+					count = h_prod;
+				}	
+				bool success =atomic_compare_exchange_strong_explicit(&(m_queue_[i].tail_consumer) , 
+						&t_cons , count ,std::memory_order_release , std::memory_order_relaxed );
+				if(!success){
+					count = 0;	
+				}
+				//  here we put in the value if succeded	
+			}else /* we steal normal */{
+				bool t = __builtin_uaddl_overflow(t_cons , BI , &count );
+				if((h_prod < count)  || (t && count > h_prod)) {
+					count = h_prod ;
+				}
+
+				bool success = atomic_compare_exchange_strong_explicit(&(m_queue_[i].tail_consumer), 
+						&t_cons , count , std::memory_order_release , std::memory_order_relaxed);
+				if(!success) {count = 0 ;}
+
+			}
+
+			if(count !=0 ){
+				local_consumer->ma_remote_addr_ = m_addrs_[i];
+				local_consumer->m_local_curr_read_ = count ; 
+				local_consumer->m_local_read_left_ = count ;
+				return count ;}
+			sched_yield();
+		}
+		
+	}
+	return 0; /* Meaning error for no free lunch to steal */
+}
+
+
 template <typename T, size_t P, size_t C, size_t SZ ,size_t BI ,  size_t BS , size_t CS> 
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 template <ZC_TYPE A , typename zc_tstruct> 
 int zc_ring<T, P , C ,SZ ,  BI , BS , CS>::init_queue(zc_tstruct* data){
 	if(!data){
@@ -340,7 +400,7 @@ int zc_ring<T, P , C ,SZ ,  BI , BS , CS>::init_queue(zc_tstruct* data){
 
 // BUGGY m,ight have the local not being added 
 template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 int  zc_ring<T, P , C ,SZ , BI , BS , CS>::get_prod_write_buffer(T** data , local_prod_data_t* local_data ,size_t sz ){
 	/* cnhage writer m_local number */ 
 	/* Resturcture this array udue to high number of if else state,ents*/
@@ -393,7 +453,7 @@ int  zc_ring<T, P , C ,SZ , BI , BS , CS>::get_prod_write_buffer(T** data , loca
 
 // Use proper alignement on your values 
 template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 int   zc_ring<T, P , C ,SZ , BI , BS , CS>::push_bulk(void* addr , size_t sz ){
 	if(!addr){return -1; /* ERROR */}
 	constexpr size_t alignmentOfT = alignof(T) < 64 ? alignof(T) : 64 ;
@@ -403,7 +463,7 @@ int   zc_ring<T, P , C ,SZ , BI , BS , CS>::push_bulk(void* addr , size_t sz ){
 
 
 template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_get_buffer( local_cons_data_t* local_data, const T** buf){
 	if(!buf && !local_data){
 		return -1; /* ERROR */
@@ -411,6 +471,7 @@ int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_get_buffer( local_cons_data_t* loc
 	
 	constexpr size_t alignmentOfT = alignof(T) < 64 ? alignof(T) : 64 ;
 	constexpr size_t payload_sz_alignment = ((sizeof(std::uint32_t) * 2 ) <= alignmentOfT) ? (sizeof(std::uint32_t)* 2 )  : alignmentOfT;
+
 	auto no_of_local_read_left = local_data->m_local_read_left_ ; 
 	
 	if(no_of_local_read_left == 0 ){
@@ -424,11 +485,10 @@ int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_get_buffer( local_cons_data_t* loc
 	return sz ;
 }
 template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> && std::is_trivially_destructible_v<T>
 int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_bulk( size_t sz ){
 
 	/* idea for pop hold onto the real atomic take a cache set and only change when my local is zero we might get into starvation but is less compilicated than hammering the atomic everysingle time or use an atomic to hammer on write   */
-
 	return sz ;
 }
 int main(){
