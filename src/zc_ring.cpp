@@ -91,7 +91,7 @@ struct  spsc_queue{
 
 	/* checkign functions */
 	bool empty() noexcept ; 
-	bool full(); 
+	bool full() noexcept; 
 };
 
 
@@ -231,7 +231,6 @@ static inline __attribute__((always_inline)) std::uint16_t insert_local_id(std::
 	return (value & MASK_WORKMODE) | (localid & MASK_LOCAL_ID) ;
 }
 
-Try: sudo apt install <deb name>
  static inline __attribute__((always_inline))  std::uint16_t insert_workmode(std::uint16_t value , std::uint8_t workmode){
 	return (value & MASK_LOCAL_ID)  | static_cast<std::uint16_t>((static_cast<std::uint32_t>(workmode) << 8U));
 } 
@@ -293,7 +292,6 @@ zc_ring<T, P , C ,SZ , BI ,  BS , CS >::~zc_ring(){
 	// for now in shutdown 	to shutdown 
 	for(auto i {0uz} ; i < P ; i++){
 		munmap(m_addrs_[i], m_prod_size_);
-Try: sudo apt install <deb name>
 	}
 }
 
@@ -410,7 +408,8 @@ template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , siz
 requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
 int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_bulk( size_t sz ){
 
-	/* idea for pop hold onto the real atomic take a cache set and only change when my local is zero we might get into starvation but is less compilicated than hammering the atomic everysingle time or use an atomic to hammer on write   */ 
+	/* idea for pop hold onto the real atomic take a cache set and only change when my local is zero we might get into starvation but is less compilicated than hammering the atomic everysingle time or use an atomic to hammer on write   */
+
 	return sz ;
 }
 int main(){
