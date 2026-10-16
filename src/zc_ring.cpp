@@ -13,6 +13,8 @@ copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
  */
 
+#include <concepts>
+#include <cstddef>
 #include <unistd.h>
 #include <linux/mman.h>
 #include <atomic>
@@ -51,14 +53,16 @@ enum class local_state_mask : std::uint8_t {
 struct __attribute__((aligned(64))) local_prod_data_t{
 	void* m_remote_addr_ ;
 	void* m_addr_ ; /* This contains 16 bits of local_write_left and conatins the addr to the pointer to the interal queue*/ 
-	std::uint64_t m_local_curr_write_;
+	std::uint32_t m_local_curr_write_;
+	std::uint32_t m_local_write_left_;
 	std::uint16_t m_local_id_and_work_mode_ ;/* contains localid and the work mode */
 	std::uint8_t m_mask ;/* mask contains bit 0-2 state if mask is emtpty , full , ready*/
 }; 
 struct __attribute__(( aligned(64))) local_cons_data_t{
 	void* ma_remote_addr_ ; /* contians the mask of the work steal mode and the remote address*/
 	void* m_addr_ ; /* This contains 16 bits of local_read_left and conatins the addr to the pointer to the interal queue*/ 
-	std::uint64_t m_local_curr_read_;
+	std::uint32_t m_local_curr_read_;
+	std::uint32_t m_local_read_left_;
 	std::uint16_t m_local_id_and_work_mode_ ;/* contains localid and the work mode */
 	std::uint8_t m_mask ; /* mask contains bit 0-2 state if mask is emtpty , full , ready*/ 
 };
@@ -97,12 +101,15 @@ struct  spsc_queue{
 template <size_t S >
 concept is_multiple_of_8 = S % 8 == 0 ;
 
+template <size_t S> 
+concept is_properly_aligned = ((S % 2) == 0 )  && ((S% 4) == 0 ) && (S % 8 ==  0) ;
 
 /* ZC_RING */
 template <typename T , size_t P /*PRODUCER*/, size_t C /* CONSUMER*/ , size_t SZ /*SIZE OF BUFFER */ ,
 	  size_t BI = 8 /* batch increment i.e BATCH_SIZE * BI is how much a producer will produce or consume */ ,
-	  size_t BS = 64 /*BATCH_SIZE*/>
-requires is_multiple_of_8<SZ>
+	  size_t BS = 64 /*BATCH_SIZE*/,
+	  size_t CS = 64 /* Cache line size*/ >
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
 struct zc_ring{
 	public : 
 
@@ -122,15 +129,18 @@ struct zc_ring{
 		 * This saves space and reduces instructions count spent on copying */ 
 		int  get_prod_write_buffer(T** , local_prod_data_t* data , size_t sz );
 		/* This pushes the bulk to the queue */
-		int push_bulk(size_t sz);
+		int push_bulk(void* addr  , size_t sz);
 
 		__attribute__((always_inline)) inline int push(){
 			return push_bulk(1);
 		}
+		__attribute__((always_inline)) inline int push_empty(){
+			return push_bulk(0);
+		}
 		/* This gives the buffer that conatins the values 
 		 * Owners of consumers can decide to wait as long as possible to do stuff with the buffer 
 		 * NOTE delayed time with the buffer will lead to blocking and that queue will not be able to move on*/
-		int pop_get_buffer(const T** buf);
+		int pop_get_buffer(local_cons_data_t* local_data ,const T** buf);
 		
 		/* This frees up the space in the buffer for write to begin*/
 		int pop_bulk(size_t sz );
@@ -159,10 +169,11 @@ struct zc_ring{
 
 };
 
-template <typename T , size_t SZ>
+template <typename T >
 struct alignas(64) Payload{
 	std::uint32_t m_sz_; /* here store size and the mask of whether its junk corrupted or it has value */
-	alignas(alignof(T)) T m_data[SZ];
+	std::uint32_t m_actual_data_sz ; /* sizeof the actual data filled here  with bit of mask*/
+	alignas(alignof(T)) T m_data;
 	
 };
 // FUNCTIONS AND HELPERS
@@ -220,6 +231,7 @@ static inline __attribute__((always_inline)) std::uint16_t insert_local_id(std::
 	return (value & MASK_WORKMODE) | (localid & MASK_LOCAL_ID) ;
 }
 
+Try: sudo apt install <deb name>
  static inline __attribute__((always_inline))  std::uint16_t insert_workmode(std::uint16_t value , std::uint8_t workmode){
 	return (value & MASK_LOCAL_ID)  | static_cast<std::uint16_t>((static_cast<std::uint32_t>(workmode) << 8U));
 } 
@@ -228,9 +240,9 @@ static inline __attribute__((always_inline)) std::uint16_t insert_local_id(std::
 
 //--------------------------------------------------------
 
-template <typename T, size_t P, size_t C, size_t SZ , size_t BI  , size_t BS>  
-requires is_multiple_of_8<SZ>
-zc_ring<T, P, C , SZ ,  BI , BS>::zc_ring(){
+template <typename T, size_t P, size_t C, size_t SZ , size_t BI  , size_t BS , size_t CS >  
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+zc_ring<T, P, C , SZ ,  BI , BS , CS >::zc_ring(){
 	/* Regualr allocation for arays in which producer are less than a page size */
 	if constexpr ((SZ/P) <= (1024ULL * 4)) {
 		constexpr size_t prod_count = ((SZ/P) + 64ULL)  & ~MASK_63 ;
@@ -275,59 +287,131 @@ zc_ring<T, P, C , SZ ,  BI , BS>::zc_ring(){
 	}
 }
 
-template <typename T, size_t P, size_t C, size_t SZ , size_t BI ,  size_t BS>                                               
-requires is_multiple_of_8<SZ>
-zc_ring<T, P , C ,SZ , BI ,  BS>::~zc_ring(){
+template <typename T, size_t P, size_t C, size_t SZ , size_t BI ,  size_t BS , size_t CS >                                               
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+zc_ring<T, P , C ,SZ , BI ,  BS , CS >::~zc_ring(){
 	// for now in shutdown 	to shutdown 
 	for(auto i {0uz} ; i < P ; i++){
 		munmap(m_addrs_[i], m_prod_size_);
+Try: sudo apt install <deb name>
 	}
 }
 
 
-template <typename T, size_t P, size_t C, size_t SZ ,size_t BI ,  size_t BS> 
-requires is_multiple_of_8<SZ>
+template <typename T, size_t P, size_t C, size_t SZ ,size_t BI ,  size_t BS , size_t CS> 
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
 template <ZC_TYPE A , typename zc_tstruct> 
-int zc_ring<T, P , C ,SZ ,  BI , BS>::init_queue(zc_tstruct* data){
+int zc_ring<T, P , C ,SZ ,  BI , BS , CS>::init_queue(zc_tstruct* data){
+	if(!data){
+		return -1; /* EROOR */
+	}
 	if constexpr ((A == ZC_TYPE::PROD) && std::is_same_v<zc_tstruct ,local_prod_data_t > ) {
 		auto id = generate_thread_id_prod();
 		m_queue_[id].head_producer.store( 0 , std::memory_order_release);
 	 	auto ptr = m_addrs_[id];
-		new (data) local_prod_data_t{nullptr,insert_size_to_addr(ptr,0) ,0 , insert_workmode(id,0) , 0 };
+		new (data) local_prod_data_t{nullptr,insert_size_to_addr(ptr,0) ,0 ,0 , insert_workmode(id,0) , 0 };
 		return id; 
 	
 	}else if constexpr ((A == ZC_TYPE::CONSU) && std::is_same_v<zc_tstruct , local_cons_data_t>) {
 		auto id = generate_thread_id_prod();
 		m_queue_[id].tail_consumer.store(0, std::memory_order_release);
 	 	auto ptr = m_addrs_[id];
-		new (data) local_cons_data_t{0 ,insert_size_to_addr(ptr,0) ,0 , insert_workmode(id,0) , 0 };
+		new (data) local_cons_data_t{0 ,insert_size_to_addr(ptr,0) , 0 ,0 , insert_workmode(id,0) , 0 };
 		return id ;
 	}else {
 		static_assert(false, "This type doesnot exit " );
 	}
 }
 
-
-template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS> 
-requires is_multiple_of_8<SZ>
-int  zc_ring<T, P , C ,SZ , BI , BS>::get_prod_write_buffer(T** data , local_prod_data_t* local_data ,size_t sz ){
-
+// BUGGY m,ight have the local not being added 
+template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+int  zc_ring<T, P , C ,SZ , BI , BS , CS>::get_prod_write_buffer(T** data , local_prod_data_t* local_data ,size_t sz ){
+	/* cnhage writer m_local number */ 
+	/* Resturcture this array udue to high number of if else state,ents*/
+	/* check for nullptr */
+	if(!data && !local_data){
+		return -1 ; /* ERROR */
+	}
+	constexpr size_t alignmentOfT = alignof(T) < 64 ? alignof(T) : 64 ;
+	constexpr size_t payload_sz_alignment = ((sizeof(std::uint32_t) * 2 ) <= alignmentOfT) ? (sizeof(std::uint32_t)* 2 )  : alignmentOfT;
+	std::size_t tmp1 = (payload_sz_alignment + (sizeof(T) * sz)) & ~(BS -1) ; 
+	std::size_t pyld_aligned_BS_cnt = tmp1 / BS ; 
 	auto ptr_buf = local_data->m_addr_ ;
 	auto id = extract_local_id(local_data->m_local_id_and_work_mode_);
-	std::uint16_t no_buf_space_left = extract_localno_from_addr(ptr_buf);
+	std::uint16_t no_buf_space_left /* amount of buffer space left in local*/ = extract_localno_from_addr(ptr_buf);
+	/* this should not junk instruction cache and should e a fucntion that is not inline*/ 
 	if(no_buf_space_left == 0 ){
+		*data = reinterpret_cast<T*>(nullptr);
 		if(m_queue_[id].full()){ /*work needded here */
-			*data = reinterpret_cast<T*>(nullptr);
 			return -1 ; /* no wrok stealin this is a producer */
 		}
 		auto new_inc = (sz & (BS-1)) ? (sz + BS) & (~(BS-1)) : sz ;
 		new_inc = new_inc / BS ;
 		auto inc = (new_inc < BI)  ? BI : new_inc  ;
 		std::uint64_t cons_val = m_queue_[id].tail_consumer.load(std::memory_order_acquire);
-
+		auto curr_pos =local_data->m_local_curr_write_ ; 
+		if((local_data->m_local_curr_write_  + inc ) > m_prod_size_){
+			//add stuff to the buffer and ship it out 
+			return 0 ; // return size of stuff ; // set errno flags for watage
+		}	
 		m_queue_[id].head_producer.fetch_add(inc,std::memory_order_acquire );
+		// not finshed 
 			
-	}else {}
+	}else if (no_buf_space_left <= pyld_aligned_BS_cnt ){
+		// increment local read left 
+		local_data->m_local_write_left_ = 0;
+		auto ptr = reinterpret_cast<unsigned char*>(ptr_buf) + (BS * local_data->m_local_curr_write_);
+		reinterpret_cast<Payload<T>*>(ptr)->m_sz_ = no_buf_space_left;
+		*data = reinterpret_cast<T*>(ptr+ payload_sz_alignment);
+		return no_buf_space_left / sizeof(T) ; 
+	}
+
+	local_data->m_local_write_left_ =  static_cast<std::uint32_t>(no_buf_space_left- pyld_aligned_BS_cnt) ;
+	auto ptr = reinterpret_cast<unsigned char*>(ptr_buf) + (BS * local_data->m_local_curr_write_);
+	reinterpret_cast<Payload<T>*>(ptr)->m_sz_ = static_cast<std::uint32_t>(pyld_aligned_BS_cnt) ; 
+	*data = reinterpret_cast<T*>(ptr + payload_sz_alignment);	
+	return pyld_aligned_BS_cnt / sizeof(T);	
+
+
+}
+
+// Use proper alignement on your values 
+template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+int   zc_ring<T, P , C ,SZ , BI , BS , CS>::push_bulk(void* addr , size_t sz ){
+	if(!addr){return -1; /* ERROR */}
+	constexpr size_t alignmentOfT = alignof(T) < 64 ? alignof(T) : 64 ;
+	constexpr size_t payload_sz_alignment = ((sizeof(std::uint32_t) * 2 ) <= alignmentOfT) ? (sizeof(std::uint32_t)* 2 )  : alignmentOfT;
+	*reinterpret_cast<Payload<T>*>(reinterpret_cast<unsigned char*>(addr) - payload_sz_alignment )->m_actual_data_sz = sz;
+}
+template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_get_buffer( local_cons_data_t* local_data, const T** buf){
+	if(!buf && !local_data){
+		return -1; /* ERROR */
+	}
+	
+	constexpr size_t alignmentOfT = alignof(T) < 64 ? alignof(T) : 64 ;
+	constexpr size_t payload_sz_alignment = ((sizeof(std::uint32_t) * 2 ) <= alignmentOfT) ? (sizeof(std::uint32_t)* 2 )  : alignmentOfT;
+	auto no_of_local_read_left = local_data->m_local_read_left_ ; 
+	
+	if(no_of_local_read_left == 0 ){
+		/* function that flushes and takes more sapce */
+	}
+	auto ptr = reinterpret_cast<unsigned char*>(local_data->m_addr_) + (local_data->m_local_curr_read_ * BS);
+	auto payload_BS_cnt= *reinterpret_cast<Payload<T>*>(ptr)->m_sz_;
+	local_data->m_local_curr_read_ =( local_data->m_local_curr_read_ +  payload_BS_cnt) & ~(m_prod_size_-1);
+	auto sz = *reinterpret_cast<Payload<T>*>(ptr)->m_actual_data_sz ;
+	*buf = reinterpret_cast<const T*>(ptr+ payload_sz_alignment);
+	return sz ;
+}
+template <typename T, size_t P, size_t C, size_t SZ ,size_t BI,  size_t BS , size_t CS> 
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+int zc_ring<T, P , C ,SZ , BI , BS , CS>::pop_bulk( size_t sz ){
+
+	/* idea for pop hold onto the real atomic take a cache set and only change when my local is zero we might get into starvation but is less compilicated than hammering the atomic everysingle time or use an atomic to hammer on write   */ 
+	return sz ;
 }
 int main(){
 	// [[maybe_unused]]volatile zc_ring<int,2 , 2 , 4096> p_ring {};
