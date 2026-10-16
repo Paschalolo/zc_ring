@@ -115,12 +115,17 @@ concept is_multiple_of_8 = S % 8 == 0 ;
 template <size_t S> 
 concept is_properly_aligned = ((S % 2) == 0 )  && ((S% 4) == 0 ) && (S % 8 ==  0) ;
 
-/* ZC_RING */
+/* ZC_RING 
+ * This Ring must be passed objects that are trivillay destructible passing in complect objects that handles say allocation etc or others will kill throughput by causing a non vectorizable loop to iterate thorough functions before they are used 
+ * Hence if non trivial objects are used make sure you destroy the induvidual values before it is popped 
+ * The queue will not be responsible for this for latency reasons 
+ * i.e could handle it in destroctor or opp using trivially Z_construcbkel and non tribvally constexpr on it 
+ * */
 template <typename T , size_t P /*PRODUCER*/, size_t C /* CONSUMER*/ , size_t SZ /*SIZE OF BUFFER */ ,
 	  size_t BI = 8 /* batch increment i.e BATCH_SIZE * BI is how much a producer will produce or consume */ ,
 	  size_t BS = 64 /*BATCH_SIZE*/,
 	  size_t CS = 64 /* Cache line size*/ >
-requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)>
+requires is_multiple_of_8<SZ> && is_properly_aligned<alignof(T)> 
 struct zc_ring{
 	public : 
 
