@@ -51,6 +51,12 @@ enum class local_state_mask : std::uint8_t {
 	FULL = 0x01, 
 	READY  =0x02,
 };
+
+enum class spsc_state : std::uint8_t {
+	NO_WORK_STEAL, WORK_STEAL
+};
+
+
 /* struct definitions */
 struct __attribute__((aligned(64))) local_prod_data_t{
 	void* m_remote_addr_ ;
@@ -90,12 +96,12 @@ struct  spsc_queue{
 	 * This will be hit by cnosumers who work steal at synchronization 
 	 * */
 	alignas(std::hardware_destructive_interference_size* 2 )std::atomic<std::uint64_t> tail_consumer ;
-
+	std::atomic<std::uint8_t> m_mask_w ;/* contains mask to show if the current stuff is being stole from */
 	/* this represents the local state of the consumer where its actual buffer has been read and can be reclaimined for writing 
 	 * This is what is deisplayed locally to my lcoal count to know how much i have actually read and is freable to use for writing . Hence this will be hit by producers on synchronization time 
 	 * */
 	alignas(std::hardware_destructive_interference_size * 2 ) std::atomic<std::uint64_t> tail_consumer_actual;
-
+	
 
 	
 	
@@ -326,8 +332,13 @@ int zc_ring<T, P, C , SZ ,  BI , BS , CS >::work_steal(local_cons_data_t* local_
 	auto id = extract_local_id(local_consumer->m_local_id_and_work_mode_);
 	for(auto i{0uz} ; i < P ; i++){
 		if(static_cast<std::uint64_t>(id) != i){
+			auto state = m_queue_[i].m_mask_w.load(std::memory_order_acquire);
+
+			
+			if (state == std::to_underlying(spsc_state::WORK_STEAL)) {goto fin ;}
 			auto h_prod = m_queue_[i].head_producer.load(std::memory_order_acquire);	
 			auto t_cons =m_queue_[i].tail_consumer.load(std::memory_order_acquire);
+
 			// check empty
 			if(h_prod == t_cons){
 				sched_yield() ; 
@@ -361,13 +372,15 @@ int zc_ring<T, P, C , SZ ,  BI , BS , CS >::work_steal(local_cons_data_t* local_
 
 			if(count !=0 ){
 				local_consumer->ma_remote_addr_ = m_addrs_[i];
+				local_consumer->m_local_id_and_work_mode_ = insert_workmode(local_consumer->m_local_id_and_work_mode_, 0x01);
 				local_consumer->m_local_curr_read_ = count ; 
 				local_consumer->m_local_read_left_ = count ;
 				return count ;}
 			sched_yield();
 		}
 		
-	}
+		}
+fin : 
 	return 0; /* Meaning error for no free lunch to steal */
 }
 
